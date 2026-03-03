@@ -268,6 +268,12 @@ class VideoProcessor:
             new_w = int(cur_w * scale)
             new_h = int(cur_h * scale)
             img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            cur_w, cur_h = img.size
+
+        # 尺寸过滤：舍弃过小的图片
+        # 最长边 < 900 且 最短边 <= 600 时舍弃
+        if max(cur_w, cur_h) < 900 and min(cur_w, cur_h) <= 600:
+            return None
 
         return img
 
