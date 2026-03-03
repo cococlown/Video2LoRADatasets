@@ -1,5 +1,6 @@
 """
 视频处理模块：从视频中随机抽取帧并生成人物数据集
+支持 CLIPIQA 画质评估与步长窗口最优帧选择
 """
 
 import os
@@ -25,6 +26,14 @@ try:
     FACE_CLUSTER_AVAILABLE = True
 except ImportError:
     FACE_CLUSTER_AVAILABLE = False
+
+# 尝试导入 IQA 评估依赖
+try:
+    import pyiqa
+    from torchvision.transforms import ToTensor
+    IQA_AVAILABLE = True
+except ImportError:
+    IQA_AVAILABLE = False
 
 
 def get_smart_crop_box(img_w, img_h, bbox, padding_ratio=0.15, min_side_len=800):
@@ -164,12 +173,18 @@ class FaceCluster:
 
 
 class VideoProcessor:
-    """视频处理器：抽取帧并进行人物检测与裁切"""
+    """视频处理器：抽取帧并进行人物检测与裁切，支持 CLIPIQA 画质评估"""
+
+    # 步长窗口偏移配置
+    SEARCH_OFFSETS = [0, -5, 5, -10, 10]
+    # 画质评分阈值（>=此值直接采纳）
+    IQA_SCORE_THRESHOLD = 0.65
 
     def __init__(self, model_name: str = 'yolov8x.pt'):
         self.model_name = model_name
         self.model = None
         self.device = None
+        self.iqa_metric = None
 
     def _init_model(self):
         """延迟初始化模型"""
@@ -190,6 +205,16 @@ class VideoProcessor:
         else:
             self.device = 'cpu'
             print("⚠️ 警告: 未检测到 GPU，正在使用 CPU (速度较慢)。")
+
+        # 初始化 CLIPIQA 模型
+        if IQA_AVAILABLE and self.iqa_metric is None:
+            try:
+                print("正在加载 CLIPIQA 画质评估模型...")
+                self.iqa_metric = pyiqa.create_metric('clipiqa', device=self.device)
+                print("✅ CLIPIQA 模型加载成功")
+            except Exception as e:
+                print(f"⚠️ CLIPIQA 加载失败: {e}，将使用默认策略")
+                self.iqa_metric = None
 
     def get_video_info(self, video_path: str) -> Tuple[int, float, int, int]:
         """
@@ -256,6 +281,7 @@ class VideoProcessor:
     ) -> Tuple[int, int]:
         """
         处理视频：随机抽取帧并进行人物检测与裁切
+        使用步长窗口策略选择最优画质帧
 
         参数:
             video_path: 视频文件路径
@@ -294,6 +320,11 @@ class VideoProcessor:
         detected_count = 0
         saved_idx = 0
 
+        # 是否启用 IQA 评估
+        use_iqa = IQA_AVAILABLE and self.iqa_metric is not None
+        if use_iqa:
+            print("✅ CLIPIQA 画质评估已启用，将选择最优画质帧")
+
         try:
             for i, frame_idx in enumerate(selected_indices):
                 # 检查取消信号
@@ -301,35 +332,78 @@ class VideoProcessor:
                     print("用户取消操作")
                     break
 
-                # 跳转到目标帧
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
+                # === 步长窗口搜索策略 ===
+                best_img = None
+                best_score = -float('inf')
+                best_offset = 0
 
-                if not ret:
-                    msg = f"警告: 无法读取第 {frame_idx} 帧"
-                    print(msg)
-                    if progress_callback:
-                        progress_callback(i + 1, num_frames, msg)
-                    continue
+                for offset in self.SEARCH_OFFSETS:
+                    target_idx = frame_idx + offset
 
-                # 处理帧
-                processed_img = self.process_frame(frame)
+                    # 边界保护
+                    if target_idx < 0 or target_idx >= total_frames:
+                        continue
 
-                if processed_img is not None:
+                    # 跳转并读取帧
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+                    ret, frame = cap.read()
+
+                    if not ret:
+                        continue
+
+                    # 处理帧：YOLO 检测与人物裁切
+                    processed_img = self.process_frame(frame)
+
+                    if processed_img is None:
+                        continue  # 未检测到人物
+
+                    # === IQA 画质评估 ===
+                    if use_iqa:
+                        try:
+                            # 转为 Tensor 并评估
+                            img_tensor = ToTensor()(processed_img).unsqueeze(0).to(self.device)
+                            with torch.no_grad():
+                                score = self.iqa_metric(img_tensor).item()
+
+                            if score > best_score:
+                                best_score = score
+                                best_img = processed_img
+                                best_offset = offset
+
+                            # 提前熔断：画质已足够好
+                            if score >= self.IQA_SCORE_THRESHOLD:
+                                break
+                        except Exception as e:
+                            # IQA 评估失败，使用当前图片
+                            best_img = processed_img
+                            best_offset = offset
+                            break
+                    else:
+                        # 无 IQA 时，使用第一个检测到人物的帧
+                        best_img = processed_img
+                        best_offset = offset
+                        break
+
+                # === 保存最优帧 ===
+                if best_img is not None:
                     detected_count += 1
-                    # 保存
                     saved_idx += 1
                     new_filename = f"{saved_idx:06d}.png"
                     save_path = dest_path / new_filename
-                    processed_img.save(save_path, format='PNG', optimize=True)
+                    best_img.save(save_path, format='PNG', optimize=True)
                     success_count += 1
 
                     # 提取人脸特征
-                    has_face = face_cluster.extract_feature(processed_img, new_filename)
+                    has_face = face_cluster.extract_feature(best_img, new_filename)
                     face_status = "已提取人脸特征" if has_face else "未检测到正脸"
-                    msg = f"[{i + 1}/{num_frames}] 帧 {frame_idx}: 检测到人物 -> {new_filename} ({face_status})"
+
+                    # 日志信息
+                    if use_iqa:
+                        msg = f"[{i + 1}/{num_frames}] 帧 {frame_idx}(偏移{best_offset:+d}): 画质={best_score:.3f} -> {new_filename} ({face_status})"
+                    else:
+                        msg = f"[{i + 1}/{num_frames}] 帧 {frame_idx}: 检测到人物 -> {new_filename} ({face_status})"
                 else:
-                    msg = f"[{i + 1}/{num_frames}] 帧 {frame_idx}: 未检测到人物，跳过"
+                    msg = f"[{i + 1}/{num_frames}] 帧 {frame_idx}: 窗口内未检测到人物，跳过"
 
                 print(msg)
                 if progress_callback:
