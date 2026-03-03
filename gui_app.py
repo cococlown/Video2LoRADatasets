@@ -79,6 +79,7 @@ class ThumbnailGrid(ttk.Frame):
     MIN_THUMB_SIZE = 80
     MAX_THUMB_SIZE = 200
     DEFAULT_THUMB_SIZE = 120
+    RESIZE_THRESHOLD = 30  # 重绘阈值，减少频繁重绘
 
     def __init__(self, master, on_select_callback: Optional[Callable] = None, **kwargs):
         super().__init__(master, **kwargs)
@@ -90,6 +91,7 @@ class ThumbnailGrid(ttk.Frame):
         self.current_thumb_size = self.DEFAULT_THUMB_SIZE
         self.current_cols = 5
         self._resize_timer = None
+        self._last_render_width = 0
 
         self._setup_ui()
 
@@ -125,20 +127,25 @@ class ThumbnailGrid(ttk.Frame):
         """延迟调整大小（避免频繁重绘）"""
         if self._resize_timer:
             self.after_cancel(self._resize_timer)
-        self._resize_timer = self.after(200, lambda: self._recalculate_layout(width))
+        self._resize_timer = self.after(300, lambda: self._recalculate_layout(width))
 
     def _recalculate_layout(self, available_width: int):
         """根据可用宽度重新计算布局"""
         if not self.image_files or available_width < 100:
             return
 
-        # 计算最佳缩略图大小（目标：每行 4-6 个）
-        target_cols = max(4, min(7, available_width // 150))
+        # 只有宽度变化超过阈值才重绘
+        if abs(available_width - self._last_render_width) < self.RESIZE_THRESHOLD:
+            return
+
+        self._last_render_width = available_width
+
+        # 计算最佳缩略图大小
+        target_cols = max(4, min(8, available_width // 150))
         new_thumb_size = max(self.MIN_THUMB_SIZE, min(self.MAX_THUMB_SIZE, (available_width - 20) // target_cols - 10))
         new_cols = max(4, available_width // (new_thumb_size + 10))
 
-        # 只有当大小变化明显时才重新渲染
-        if abs(new_thumb_size - self.current_thumb_size) > 15 or new_cols != self.current_cols:
+        if abs(new_thumb_size - self.current_thumb_size) > self.RESIZE_THRESHOLD or new_cols != self.current_cols:
             self.current_thumb_size = new_thumb_size
             self.current_cols = new_cols
             self._refresh_all_thumbnails()
@@ -146,7 +153,7 @@ class ThumbnailGrid(ttk.Frame):
     def _refresh_all_thumbnails(self):
         """刷新所有缩略图"""
         cell_width = self.current_thumb_size + 10
-        cell_height = self.current_thumb_size + 30
+        cell_height = self.current_thumb_size + 45  # 给文件名预留更多空间
 
         # 清空现有卡片
         for widget in self.inner_frame.winfo_children():
@@ -176,7 +183,7 @@ class ThumbnailGrid(ttk.Frame):
 
         # 初始渲染
         cell_width = self.current_thumb_size + 10
-        cell_height = self.current_thumb_size + 30
+        cell_height = self.current_thumb_size + 45
         self._render_thumbnails_async(cell_width, cell_height)
 
     def clear(self):
@@ -187,12 +194,13 @@ class ThumbnailGrid(ttk.Frame):
         self.thumbnails.clear()
         self.card_widgets.clear()
         self.selected_index = -1
+        self._last_render_width = 0
 
     def _render_thumbnails_async(self, cell_width: int, cell_height: int):
         """异步渲染缩略图"""
         total = len(self.image_files)
 
-        def render_batch(start_idx=0, batch_size=30):
+        def render_batch(start_idx=0, batch_size=50):
             end_idx = min(start_idx + batch_size, total)
 
             for idx in range(start_idx, end_idx):
@@ -220,12 +228,12 @@ class ThumbnailGrid(ttk.Frame):
         img_label = ttk.Label(card, text="...", font=("Arial", 8), anchor="center")
         img_label.place(x=5, y=2, width=thumb_size, height=thumb_size)
 
-        # 文件名
+        # 文件名 - 放在底部，预留足够空间
         name = Path(img_path).name
-        if len(name) > 14:
-            name = name[:11] + "..."
-        name_label = ttk.Label(card, text=name, font=("Arial", 8), anchor="center")
-        name_label.place(x=0, y=thumb_size + 5, width=cell_width)
+        if len(name) > 15:
+            name = name[:12] + "..."
+        name_label = ttk.Label(card, text=name, font=("Arial", 8), anchor="center", wraplength=cell_width - 4)
+        name_label.place(x=2, y=thumb_size + 8, width=cell_width - 4, height=25)
 
         # 缓存
         self.card_widgets[idx] = {'card': card, 'img_label': img_label}
@@ -244,10 +252,7 @@ class ThumbnailGrid(ttk.Frame):
                 with Image.open(img_path) as img:
                     img.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
                     thumb = ImageTk.PhotoImage(img)
-
-                    # 缓存原始图片数据用于后续缩放
                     self.thumbnails[img_path] = {'photo': thumb, 'path': img_path}
-
                     self.after(0, lambda: self._update_thumbnail_label(label, thumb))
             except Exception:
                 pass
@@ -285,26 +290,21 @@ class ThumbnailGrid(ttk.Frame):
         return len(self.image_files)
 
     def remove_image(self, index: int):
-        """移除图片"""
+        """移除图片并重新渲染"""
         if 0 <= index < len(self.image_files):
             img_path = self.image_files[index]
             del self.image_files[index]
 
             if img_path in self.thumbnails:
                 del self.thumbnails[img_path]
-            if index in self.card_widgets:
-                self.card_widgets[index]['card'].destroy()
-                del self.card_widgets[index]
 
-            self._rebuild_grid()
+            # 重新渲染整个网格（确保正确补位）
+            self._refresh_all_thumbnails()
             self.selected_index = min(index, len(self.image_files) - 1)
 
-    def _rebuild_grid(self):
-        """重建网格位置"""
-        for idx, path in enumerate(self.image_files):
-            if idx in self.card_widgets:
-                card = self.card_widgets[idx]['card']
-                card.grid(row=idx // self.current_cols, column=idx % self.current_cols, padx=2, pady=2)
+            # 自动选中下一个
+            if self.image_files and self.selected_index >= 0:
+                self._on_thumbnail_click(self.selected_index)
 
 
 # ============================================================
@@ -433,19 +433,18 @@ class ImagePreviewPanel(ttk.Frame):
             self.on_navigate(direction)
 
     def _delete_image(self):
-        """删除当前图片"""
+        """删除当前图片（无确认）"""
         if not self.current_image_path:
             return
 
-        file_name = Path(self.current_image_path).name
-        if messagebox.askyesno("确认删除", f"确定要删除这张图片吗？\n\n{file_name}"):
-            try:
-                os.remove(self.current_image_path)
-                messagebox.showinfo("删除成功", f"已删除: {file_name}")
-                if self.on_delete:
-                    self.on_delete(self.current_image_path)
-            except Exception as e:
-                messagebox.showerror("删除失败", f"删除文件时出错:\n{e}")
+        try:
+            file_name = Path(self.current_image_path).name
+            os.remove(self.current_image_path)
+            # 删除成功后直接回调，不弹窗
+            if self.on_delete:
+                self.on_delete(self.current_image_path)
+        except Exception as e:
+            messagebox.showerror("删除失败", f"删除文件时出错:\n{e}")
 
     def update_navigation(self, has_prev: bool, has_next: bool):
         """更新导航按钮状态"""
