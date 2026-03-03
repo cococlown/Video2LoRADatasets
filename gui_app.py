@@ -8,6 +8,7 @@ import os
 import sys
 import ctypes
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
@@ -70,28 +71,32 @@ def get_available_output_dirs() -> list:
 
 
 # ============================================================
-# 缩略图网格组件（动态调整版本）
+# 缩略图网格组件（优化版：线程池 + 内存缓存）
 # ============================================================
 
 class ThumbnailGrid(ttk.Frame):
-    """可滚动的缩略图网格 - 支持动态调整大小"""
+    """可滚动的缩略图网格 - 支持动态调整大小，优化性能"""
 
     MIN_THUMB_SIZE = 80
     MAX_THUMB_SIZE = 200
     DEFAULT_THUMB_SIZE = 120
-    RESIZE_THRESHOLD = 30  # 重绘阈值，减少频繁重绘
+    RESIZE_THRESHOLD = 30
 
     def __init__(self, master, on_select_callback: Optional[Callable] = None, **kwargs):
         super().__init__(master, **kwargs)
         self.on_select = on_select_callback
         self.image_files = []
-        self.thumbnails = {}  # 缓存原始缩略图
+        # 缓存结构: {img_path: {'photo': ImageTk.PhotoImage, 'pil_img': PIL.Image, 'size': int}}
+        self.thumbnails = {}
         self.card_widgets = {}
         self.selected_index = -1
         self.current_thumb_size = self.DEFAULT_THUMB_SIZE
         self.current_cols = 5
         self._resize_timer = None
         self._last_render_width = 0
+
+        # 线程池限制并发，避免线程爆炸
+        self.executor = ThreadPoolExecutor(max_workers=4)
 
         self._setup_ui()
 
@@ -124,7 +129,7 @@ class ThumbnailGrid(ttk.Frame):
         self._schedule_resize(event.width)
 
     def _schedule_resize(self, width: int):
-        """延迟调整大小（避免频繁重绘）"""
+        """延迟调整大小"""
         if self._resize_timer:
             self.after_cancel(self._resize_timer)
         self._resize_timer = self.after(300, lambda: self._recalculate_layout(width))
@@ -134,13 +139,11 @@ class ThumbnailGrid(ttk.Frame):
         if not self.image_files or available_width < 100:
             return
 
-        # 只有宽度变化超过阈值才重绘
         if abs(available_width - self._last_render_width) < self.RESIZE_THRESHOLD:
             return
 
         self._last_render_width = available_width
 
-        # 计算最佳缩略图大小
         target_cols = max(4, min(8, available_width // 150))
         new_thumb_size = max(self.MIN_THUMB_SIZE, min(self.MAX_THUMB_SIZE, (available_width - 20) // target_cols - 10))
         new_cols = max(4, available_width // (new_thumb_size + 10))
@@ -151,9 +154,10 @@ class ThumbnailGrid(ttk.Frame):
             self._refresh_all_thumbnails()
 
     def _refresh_all_thumbnails(self):
-        """刷新所有缩略图"""
+        """刷新所有缩略图（复用缓存，避免重复 I/O）"""
         cell_width = self.current_thumb_size + 10
-        cell_height = self.current_thumb_size + 45  # 给文件名预留更多空间
+        cell_height = self.current_thumb_size + 45
+        thumb_size = self.current_thumb_size
 
         # 清空现有卡片
         for widget in self.inner_frame.winfo_children():
@@ -162,7 +166,7 @@ class ThumbnailGrid(ttk.Frame):
 
         # 重新创建卡片
         for idx, img_path in enumerate(self.image_files):
-            self._create_thumbnail_card(idx, cell_width, cell_height)
+            self._create_thumbnail_card(idx, cell_width, cell_height, thumb_size)
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -181,13 +185,12 @@ class ThumbnailGrid(ttk.Frame):
             if f.is_file() and f.suffix.lower() in valid_exts:
                 self.image_files.append(str(f))
 
-        # 初始渲染
         cell_width = self.current_thumb_size + 10
         cell_height = self.current_thumb_size + 45
-        self._render_thumbnails_async(cell_width, cell_height)
+        self._render_thumbnails_async(cell_width, cell_height, self.current_thumb_size)
 
     def clear(self):
-        """清空"""
+        """清空并释放资源"""
         for widget in self.inner_frame.winfo_children():
             widget.destroy()
         self.image_files.clear()
@@ -196,7 +199,7 @@ class ThumbnailGrid(ttk.Frame):
         self.selected_index = -1
         self._last_render_width = 0
 
-    def _render_thumbnails_async(self, cell_width: int, cell_height: int):
+    def _render_thumbnails_async(self, cell_width: int, cell_height: int, thumb_size: int):
         """异步渲染缩略图"""
         total = len(self.image_files)
 
@@ -204,20 +207,19 @@ class ThumbnailGrid(ttk.Frame):
             end_idx = min(start_idx + batch_size, total)
 
             for idx in range(start_idx, end_idx):
-                self._create_thumbnail_card(idx, cell_width, cell_height)
+                self._create_thumbnail_card(idx, cell_width, cell_height, thumb_size)
 
             if end_idx < total:
                 self.after(5, lambda: render_batch(end_idx, batch_size))
 
         render_batch()
 
-    def _create_thumbnail_card(self, idx: int, cell_width: int, cell_height: int):
+    def _create_thumbnail_card(self, idx: int, cell_width: int, cell_height: int, thumb_size: int):
         """创建单个缩略图卡片"""
         if idx in self.card_widgets:
             return
 
         img_path = self.image_files[idx]
-        thumb_size = self.current_thumb_size
 
         # 创建卡片
         card = ttk.Frame(self.inner_frame, width=cell_width, height=cell_height)
@@ -228,7 +230,7 @@ class ThumbnailGrid(ttk.Frame):
         img_label = ttk.Label(card, text="...", font=("Arial", 8), anchor="center")
         img_label.place(x=5, y=2, width=thumb_size, height=thumb_size)
 
-        # 文件名 - 放在底部，预留足够空间
+        # 文件名
         name = Path(img_path).name
         if len(name) > 15:
             name = name[:12] + "..."
@@ -242,22 +244,55 @@ class ThumbnailGrid(ttk.Frame):
         card.bind("<Button-1>", lambda e, i=idx: self._on_thumbnail_click(i))
         img_label.bind("<Button-1>", lambda e, i=idx: self._on_thumbnail_click(i))
 
-        # 异步加载图片
-        self._load_thumbnail_async(idx, img_path, img_label, thumb_size)
+        # 检查缓存，决定是否需要从磁盘加载
+        if img_path in self.thumbnails:
+            # 复用缓存的 PIL Image
+            cached = self.thumbnails[img_path]
+            pil_img = cached.get('pil_img')
 
-    def _load_thumbnail_async(self, idx: int, img_path: str, label: ttk.Label, thumb_size: int):
-        """异步加载缩略图"""
-        def load():
-            try:
-                with Image.open(img_path) as img:
-                    img.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
-                    thumb = ImageTk.PhotoImage(img)
-                    self.thumbnails[img_path] = {'photo': thumb, 'path': img_path}
-                    self.after(0, lambda: self._update_thumbnail_label(label, thumb))
-            except Exception:
-                pass
+            if pil_img:
+                # 尺寸匹配则直接使用，否则缩放
+                if cached.get('size') == thumb_size:
+                    photo = cached.get('photo')
+                else:
+                    # 从缓存的 PIL Image 缩放
+                    resized = pil_img.resize((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(resized)
+                    # 更新缓存
+                    self.thumbnails[img_path] = {
+                        'photo': photo,
+                        'pil_img': pil_img,
+                        'size': thumb_size
+                    }
 
-        threading.Thread(target=load, daemon=True).start()
+                self._update_thumbnail_label(img_label, photo)
+                return
+
+        # 无缓存，使用线程池异步加载
+        self.executor.submit(self._load_thumbnail_task, img_path, img_label, thumb_size)
+
+    def _load_thumbnail_task(self, img_path: str, label: ttk.Label, thumb_size: int):
+        """线程池任务：加载缩略图"""
+        try:
+            with Image.open(img_path) as img:
+                # 创建缩略图
+                pil_thumb = img.copy()
+                pil_thumb.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+
+                # 转 PhotoImage
+                photo = ImageTk.PhotoImage(pil_thumb)
+
+                # 缓存 PIL Image 和 PhotoImage
+                self.thumbnails[img_path] = {
+                    'photo': photo,
+                    'pil_img': pil_thumb,
+                    'size': thumb_size
+                }
+
+                # 在主线程更新 UI
+                self.after(0, lambda: self._update_thumbnail_label(label, photo))
+        except Exception:
+            pass
 
     def _update_thumbnail_label(self, label: ttk.Label, thumb: ImageTk.PhotoImage):
         """更新缩略图标签"""
@@ -298,7 +333,7 @@ class ThumbnailGrid(ttk.Frame):
             if img_path in self.thumbnails:
                 del self.thumbnails[img_path]
 
-            # 重新渲染整个网格（确保正确补位）
+            # 重新渲染整个网格
             self._refresh_all_thumbnails()
             self.selected_index = min(index, len(self.image_files) - 1)
 
