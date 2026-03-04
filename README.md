@@ -20,7 +20,7 @@
 ### 1. 安装依赖
 
 ```bash
-pip install ultralytics pillow numpy opencv-python-headless ttkbootstrap insightface scikit-learn
+pip install ultralytics pillow numpy opencv-python-headless insightface scikit-learn nicegui pyiqa torchvision
 ```
 
 ### 2. 启动程序
